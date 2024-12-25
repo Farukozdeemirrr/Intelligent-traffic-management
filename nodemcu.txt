@@ -1,0 +1,122 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+
+// Pin tanımlamaları
+#define LAMBA1_YESIL D0
+#define LAMBA1_SARI D2
+#define LAMBA1_KIRMIZI D1
+
+#define LAMBA2_YESIL D6
+#define LAMBA2_SARI D7
+#define LAMBA2_KIRMIZI D8
+
+// Wi-Fi bilgileri
+const char* ssid = "FiberHGW_HUUG1R";
+const char* password = "DfTfavv9ddn9";
+
+// Web sunucusu
+ESP8266WebServer server(80);
+
+// Fonksiyon prototipleri
+void resetLights();
+void setGreenLight(int direction, int greenTime);
+
+void setup() {
+  // Seri iletişimi başlat
+  Serial.begin(115200);
+
+  // Pin modlarını ayarla
+  pinMode(LAMBA1_YESIL, OUTPUT);
+  pinMode(LAMBA1_SARI, OUTPUT);
+  pinMode(LAMBA1_KIRMIZI, OUTPUT);
+
+  pinMode(LAMBA2_YESIL, OUTPUT);
+  pinMode(LAMBA2_SARI, OUTPUT);
+  pinMode(LAMBA2_KIRMIZI, OUTPUT);
+
+  // Tüm ışıkları sıfırla
+  resetLights();
+
+  // Wi-Fi'ye bağlan
+  WiFi.begin(ssid, password);
+  Serial.print("Wi-Fi'ye bağlanılıyor");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi bağlantısı kuruldu.");
+  Serial.print("IP adresi: ");
+  Serial.println(WiFi.localIP());
+
+  // Web sunucusunu başlat
+  server.on("/update", HTTP_POST, []() {
+      // Gelen veriyi al
+      String data = server.arg("plain");
+      Serial.println("Gelen veri: " + data);
+
+      // Veriyi ayrıştır
+      int commaIndex = data.indexOf(',');
+      if (commaIndex == -1) {
+          // Yanıt: Geçersiz veri formatı
+          server.send(400, "text/plain", "Geçersiz veri formatı.");
+          return;
+      }
+
+      // Yön ve süreyi ayrıştır
+      int direction = data.substring(0, commaIndex).toInt();
+      int greenTime = data.substring(commaIndex + 1).toInt();
+
+      // Geçersiz değer kontrolü
+      if (direction < 0 || direction > 1 || greenTime <= 0) {
+          // Yanıt: Geçersiz değer
+          server.send(400, "text/plain", "Geçersiz yön veya süre.");
+          return;
+      }
+
+      // Başarılı yanıt ver
+      server.send(200, "text/plain", "OK");
+
+      // Trafik ışıklarını ayarla
+      resetLights();
+      setGreenLight(direction, greenTime);
+  });
+
+  server.begin();
+  Serial.println("Sunucu başlatıldı.");
+}
+
+void loop() {
+  server.handleClient();
+}
+
+void resetLights() {
+  digitalWrite(LAMBA1_YESIL, LOW);
+  digitalWrite(LAMBA1_SARI, LOW);
+  digitalWrite(LAMBA1_KIRMIZI, HIGH);
+
+  digitalWrite(LAMBA2_YESIL, LOW);
+  digitalWrite(LAMBA2_SARI, LOW);
+  digitalWrite(LAMBA2_KIRMIZI, HIGH);
+}
+
+void setGreenLight(int direction, int greenTime) {
+  if (direction == 0) { // Lamba 1
+      digitalWrite(LAMBA1_KIRMIZI, LOW);
+      digitalWrite(LAMBA1_YESIL, HIGH);
+      delay(greenTime * 1000);
+      digitalWrite(LAMBA1_YESIL, LOW);
+      digitalWrite(LAMBA1_SARI, HIGH);
+      delay(3000);
+      digitalWrite(LAMBA1_SARI, LOW);
+      digitalWrite(LAMBA1_KIRMIZI, HIGH);
+  } else if (direction == 1) { // Lamba 2
+      digitalWrite(LAMBA2_KIRMIZI, LOW);
+      digitalWrite(LAMBA2_YESIL, HIGH);
+      delay(greenTime * 1000);
+      digitalWrite(LAMBA2_YESIL, LOW);
+      digitalWrite(LAMBA2_SARI, HIGH);
+      delay(3000);
+      digitalWrite(LAMBA2_SARI, LOW);
+      digitalWrite(LAMBA2_KIRMIZI, HIGH);
+  }
+}
