@@ -11,6 +11,8 @@ import requests  # Nodemcu'ya HTTP isteği atmak için
 #########################################################
 # ROIManager: ROI (ilgi alanı) bölgesini yönetir
 #########################################################
+#nodemcu_ip = "192.168.1.114"  # Nodemcu'nun IP adresini buraya yazın
+#nodemcu_url = f"http://{nodemcu_ip}/update"
 class ROIManager:
     def __init__(self, frame_width, frame_height):
         self.roi_x1 = 0
@@ -330,17 +332,17 @@ class CameraManager:
 
 # Kamera ve trafik kontrol fonksiyonu
 def run_intersection_control(camera_ids, vehicle_data_manager, score_calculator):
-    sari_sure = 5
+    
     remaining_vehicles = {cid: 0 for cid in camera_ids}  # Her kamera için kalan araç sayısını takip eder
 
-    # İlk 5 saniye tüm yönlere kırmızı ışık
-    print("Tüm yönlere kırmızı ışık 5sn")
-    for s in range(5, 0, -1):
-        for cid in camera_ids:
-            print(f"webcam-{cid} kırmızı ışık {s}sn")
-        time.sleep(1)
-
     last_direction = None  # Son seçilen yönü takip etmek için
+
+    # İlk yoğunluğu hesapla ve en yoğun yönü seç
+    scores = score_calculator.calculate_scores(vehicle_data_manager)
+    direction_scores = {cid: scores.get(cid, 0) for cid in camera_ids}
+    sorted_dirs = sorted(direction_scores.items(), key=lambda x: x[1], reverse=True)
+
+    yellow_time = 3  # Sarı ışık süresi (sabit olarak 3 saniye)
 
     while True:
         scores = score_calculator.calculate_scores(vehicle_data_manager)
@@ -373,29 +375,30 @@ def run_intersection_control(camera_ids, vehicle_data_manager, score_calculator)
         # Skor sıfır olsa bile minimum 5 saniye yeşil ışık süresi
         green_time = int(max(min(max(chosen_score, 5), 30), 5))
 
-        light_states = {cid: 'RED' for cid in camera_ids}
-        light_states[chosen_direction] = 'GREEN'
-
         # Yeşil ışık süresi
         print(f"webcam-{chosen_direction} yeşil ışık {green_time}sn")
         vehicles_before = vehicle_data_manager.get_vehicle_data(chosen_direction).get("vehicle_count", 0)
+
+        # ESP8266'ya veri gönder: sadece yeşil ışık süresi ve yön bilgisi
+        send_to_nodemcu(chosen_direction, green_time)
 
         for s in range(green_time, 0, -1):
             print(f"webcam-{chosen_direction} yeşil ışık {s}sn")
             time.sleep(1)
 
+        # Sarı ışık simülasyonu (Python kontrol eder)
+        print(f"webcam-{chosen_direction} sarı ışık {yellow_time}sn")
+        for s in range(yellow_time, 0, -1):
+            print(f"webcam-{chosen_direction} sarı ışık {s}sn")
+            time.sleep(1)
+
+        # Kırmızı ışık kontrolü (sadece geçiş)
+        print(f"webcam-{chosen_direction} kırmızı ışık")
+
         # Geçen araçları hesapla
         vehicles_after = vehicle_data_manager.get_vehicle_data(chosen_direction).get("vehicle_count", 0)
         vehicles_cleared = max(vehicles_before - vehicles_after, 0)
         remaining_vehicles[chosen_direction] = max(0, remaining_vehicles[chosen_direction] - vehicles_cleared)
-
-        light_states[chosen_direction] = 'YELLOW'
-
-        # Sarı ışık süresi
-        print(f"webcam-{chosen_direction} sarı ışık {sari_sure}sn")
-        for s in range(sari_sure, 0, -1):
-            print(f"webcam-{chosen_direction} sarı ışık {s}sn")
-            time.sleep(1)
 
         # Yeni yeşil ışık yönünü belirle
         last_direction = chosen_direction  # Son seçilen yönü kaydet
@@ -407,44 +410,29 @@ def run_intersection_control(camera_ids, vehicle_data_manager, score_calculator)
         if next_direction is None:  # Tüm yönler sıfır skora sahipse sırayı döndür
             next_direction = chosen_direction
 
-        green_time = int(max(min(max(chosen_score, 5), 30), 5))
-        send_to_nodemcu(green_time, 5)  # Nodemcu'ya süreleri gönder
-
-        print(f"\nBir sonraki yeşil ışık: webcam-{next_direction}\n")
-        time.sleep(2)
-
-# Nodemcu'ya yön ve süre bilgisi gönderen fonksiyon
-def send_to_nodemcu(lamba1_sure, lamba2_sure):
+def send_to_nodemcu(direction, green_time):
     """
-    Nodemcu'ya süre bilgilerini gönderir ve yanıtı kontrol eder.
-    :param lamba1_sure: Lamba 1'in yeşil ışık süresi
-    :param lamba2_sure: Lamba 2'nin yeşil ışık süresi
+    Nodemcu'ya sadece yeşil ışık süresi ve yön bilgisini gönderir.
+    :param direction: Aktif yön bilgisi
+    :param green_time: Yeşil ışık süresi
     """
-    nodemcu_ip = "192.168.1.149"  # Nodemcu'nun IP adresini buraya yazın
-    nodemcu_url = f"http://{nodemcu_ip}/update"
+    nodemcu_url = "http://192.168.1.114/update"  # Nodemcu'nun IP adresini buraya yazın
 
-    payload = f"{lamba1_sure},{lamba2_sure}"
+    payload = f"{direction},{green_time}"
 
     headers = {
         "Content-Type": "text/plain"
     }
 
     try:
-        response = requests.post(nodemcu_url, data=payload, headers=headers, timeout=5)
-        if response.status_code == 200:
-            print(f"Nodemcu'ya süre bilgisi başarıyla gönderildi: Lamba1 = {lamba1_sure}, Lamba2 = {lamba2_sure}")
-            print(f"Nodemcu yanıtı: {response.text}")
-        else:
-            print(f"Nodemcu yanıtı: {response.status_code}, {response.text}")
+        requests.post(nodemcu_url, data=payload, headers=headers, timeout=5)
+        print(f"Nodemcu'ya veri gönderildi: Yön = {direction}, Süre = {green_time}sn")
     except requests.exceptions.ConnectTimeout:
         print("Nodemcu'ya bağlantı zaman aşımı.")
     except requests.exceptions.ConnectionError:
         print("Nodemcu'ya bağlantı kurulamadı. IP adresini ve ağı kontrol edin.")
     except requests.exceptions.RequestException as e:
         print(f"Nodemcu'ya bağlantı hatası: {e}")
-
-
-
 
 #########################################################
 # Ana Kod
