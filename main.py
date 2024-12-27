@@ -71,7 +71,7 @@ class VehicleDataManager:
 #########################################################
 class TrafficScoreCalculator:
     def calculate_scores(self, vehicle_data_manager):
-        weights = {"0": 20.15, "1": 15.0, "2": 0.2, "3": 0.5}
+        weights = {"0": 2.0, "1": 1.0, "2": 2.5, "3": 0.5}
         scores = {}
         with vehicle_data_manager.lock:
             for camera_id, classes in vehicle_data_manager.data.items():
@@ -175,6 +175,7 @@ class Camera:
         self.width = width
         self.height = height
         self.max_distance = max_distance
+        self.tespiti_durdur = False
 
         self.cap = cv2.VideoCapture(self.camera_id)
         if not self.cap.isOpened():
@@ -228,6 +229,15 @@ class Camera:
 
         return object_id
 
+    def pause_detection(self):
+        """Nesne tespitini durdur."""
+        self.yolo_processor.stop()
+
+    def resume_detection(self):
+        """Nesne tespitini yeniden başlat."""
+        self.yolo_processor = YOLOProcessor(self.model, self.frame_queue, self.result_queue, self.roi_manager)
+        self.yolo_processor.start()
+
     def stop(self):
         self.frame_grabber.stop()
         self.yolo_processor.stop()
@@ -258,6 +268,29 @@ class Camera:
                     break
                 continue
 
+            # ROI çizimi ve skor yazısını ekle
+            self.roi_manager.draw_roi(frame)
+
+            current_time = time.time()
+            if current_time - last_print_time >= 1.0:
+                scores = self.score_calculator.calculate_scores(self.vehicle_data_manager)
+                current_score = scores.get(self.camera_id, 0)
+                last_print_time = current_time
+
+            # Skoru her karede yaz
+            scores = self.score_calculator.calculate_scores(self.vehicle_data_manager)
+            current_score = scores.get(self.camera_id, 0)
+            cv2.putText(frame, f"Skor: {current_score:.2f}", (self.width - 200, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # Tespit durdurulmuşsa yalnızca ROI ve skor göster
+            if self.tespiti_durdur:
+                cv2.imshow(self.window_name, frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                continue
+
+            # Tespit ve nesne işleme
             for (x1, y1, x2, y2, class_id, conf) in detections:
                 obj_center = ((x1 + x2)//2, (y1 + y2)//2)
                 if self.roi_manager.is_inside_roi(obj_center[0], obj_center[1]):
@@ -267,32 +300,9 @@ class Camera:
                     cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 
                                 0.5, (255, 0, 0), 2)
 
-            self.tracked_objects = {
-                track_id: data for track_id, data in self.tracked_objects.items()
-                if time.time() - data[1] < 5
-            }
-
-            self.roi_manager.draw_roi(frame)
-
-            current_time = time.time()
-            if current_time - last_print_time >= 1.0:
-                vehicle_data = self.vehicle_data_manager.get_vehicle_data(self.camera_id)
-                scores = self.score_calculator.calculate_scores(self.vehicle_data_manager)
-                current_score = scores.get(self.camera_id, 0)
-
-                last_print_time = current_time
-
-            scores = self.score_calculator.calculate_scores(self.vehicle_data_manager)
-            current_score = scores.get(self.camera_id, 0)
-            cv2.putText(frame, f"Skor: {current_score:.2f}", (self.width - 200, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
             cv2.imshow(self.window_name, frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
-        self.stop()
-
 
 #########################################################
 # CameraManager: Birden fazla kamerayı yönetir
@@ -374,6 +384,10 @@ def run_intersection_control(camera_ids, vehicle_data_manager, score_calculator)
 
         # Skor sıfır olsa bile minimum 5 saniye yeşil ışık süresi
         green_time = int(max(min(max(chosen_score, 5), 30), 5))
+        # Yeşil ışık süresi boyunca tespiti durdur
+        for camera in manager.cameras:
+            if camera.camera_id == chosen_direction:
+                camera.tespiti_durdur = True
 
         # Yeşil ışık süresi
         print(f"webcam-{chosen_direction} yeşil ışık {green_time}sn")
@@ -392,8 +406,14 @@ def run_intersection_control(camera_ids, vehicle_data_manager, score_calculator)
             print(f"webcam-{chosen_direction} sarı ışık {s}sn")
             time.sleep(1)
 
-        # Kırmızı ışık kontrolü (sadece geçiş)
+        # Kırmızı ışık sırasında skor sıfırla ve tespiti yeniden başlat
         print(f"webcam-{chosen_direction} kırmızı ışık")
+        vehicle_data_manager.reset_camera_data(chosen_direction)
+
+        for camera in manager.cameras:
+            if camera.camera_id == chosen_direction:
+                camera.tespiti_durdur = False
+
 
         # Geçen araçları hesapla
         vehicles_after = vehicle_data_manager.get_vehicle_data(chosen_direction).get("vehicle_count", 0)
