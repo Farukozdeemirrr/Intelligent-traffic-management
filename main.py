@@ -133,6 +133,10 @@ class YOLOProcessor(threading.Thread):
             roi_frame = frame[self.roi_manager.roi_y1:self.roi_manager.roi_y2,
                               self.roi_manager.roi_x1:self.roi_manager.roi_x2]
 
+            # ROI boşsa tespit yapma
+            if roi_frame is None or roi_frame.size == 0:
+                continue
+
             with torch.no_grad():
                 results = self.model(roi_frame)
 
@@ -191,8 +195,8 @@ class Camera:
         self.tracked_objects = {}
         self.object_id_counter = 0
 
-        self.frame_queue = queue.Queue(maxsize=10)
-        self.result_queue = queue.Queue(maxsize=10)
+        self.frame_queue = queue.Queue(maxsize=5)
+        self.result_queue = queue.Queue(maxsize=5)
 
         self.frame_grabber = FrameGrabber(self.cap, self.frame_queue)
         self.yolo_processor = YOLOProcessor(self.model, self.frame_queue, self.result_queue, self.roi_manager)
@@ -268,7 +272,7 @@ class Camera:
                     break
                 continue
 
-            # ROI çizimi ve skor yazısını ekle
+            # ROI çizimi ve skor yazısı ekle
             self.roi_manager.draw_roi(frame)
 
             current_time = time.time()
@@ -277,7 +281,7 @@ class Camera:
                 current_score = scores.get(self.camera_id, 0)
                 last_print_time = current_time
 
-            # Skoru her karede yaz
+            # Her karede skor göster (bir saniye güncelleme aralığıyla)
             scores = self.score_calculator.calculate_scores(self.vehicle_data_manager)
             current_score = scores.get(self.camera_id, 0)
             cv2.putText(frame, f"Skor: {current_score:.2f}", (self.width - 200, 30),
@@ -304,6 +308,7 @@ class Camera:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
+
 #########################################################
 # CameraManager: Birden fazla kamerayı yönetir
 #########################################################
@@ -314,7 +319,10 @@ class CameraManager:
         self.score_calculator = score_calculator
         self.cameras = []
         for cam_id in camera_ids:
-            cam = Camera(cam_id, self.model, f"Kamera {cam_id}", self.vehicle_data_manager, self.score_calculator, width, height, max_distance=max_distance)
+            cam = Camera(cam_id, self.model, f"Kamera {cam_id}",
+                         self.vehicle_data_manager,
+                         self.score_calculator,
+                         width, height, max_distance=max_distance)
             self.cameras.append(cam)
 
     def start_cameras(self):
@@ -334,110 +342,99 @@ class CameraManager:
         cv2.destroyAllWindows()
 
 
-
-
 #########################################################
 # Dinamik Trafik Işığı Kontrolü (Nodemcu Entegre ve Tek Yön Yeşil, Diğerleri Kırmızı)
 #########################################################
 
-# Kamera ve trafik kontrol fonksiyonu
 def run_intersection_control(camera_ids, vehicle_data_manager, score_calculator):
-    
-    remaining_vehicles = {cid: 0 for cid in camera_ids}  # Her kamera için kalan araç sayısını takip eder
+    remaining_vehicles = {cid: 0 for cid in camera_ids}
+    last_direction = None
+    yellow_time = 3
 
-    last_direction = None  # Son seçilen yönü takip etmek için
-
-    # İlk yoğunluğu hesapla ve en yoğun yönü seç
+    # Başlangıç yoğunluğu hesapla
     scores = score_calculator.calculate_scores(vehicle_data_manager)
     direction_scores = {cid: scores.get(cid, 0) for cid in camera_ids}
     sorted_dirs = sorted(direction_scores.items(), key=lambda x: x[1], reverse=True)
 
-    yellow_time = 3  # Sarı ışık süresi (sabit olarak 3 saniye)
-
     while True:
+        # Anlık skorları al
         scores = score_calculator.calculate_scores(vehicle_data_manager)
 
         # Kameralardan gelen araç sayısını güncelle
         for cid in camera_ids:
-            vehicle_data = vehicle_data_manager.get_vehicle_data(cid)
-            detected_vehicles = vehicle_data.get("vehicle_count", 0)
-            # Eğer geçiş sonrası araçlar kalmamışsa kalan araç sayısını sıfırla
+            detected_vehicles = sum(vehicle_data_manager.get_vehicle_data(cid).values())
             if detected_vehicles == 0:
                 remaining_vehicles[cid] = 0
             else:
                 remaining_vehicles[cid] += detected_vehicles
 
+        # Final skor = YOLO skor + remaining_vehicles
         direction_scores = {}
         for cid in camera_ids:
-            # Kalan araçları mevcut skorlarla birleştir
-            density = scores.get(cid, 0) + remaining_vehicles[cid]
-            total_score = density
+            total_score = scores.get(cid, 0) + remaining_vehicles[cid]
             direction_scores[cid] = total_score
 
         # Skorları sıralama ve seçilecek yönü belirleme
         sorted_dirs = sorted(direction_scores.items(), key=lambda x: x[1], reverse=True)
         chosen_direction, chosen_score = sorted_dirs[0]
 
-        # Eğer aynı yön üst üste seçilmişse bir sonraki yön zorlanır
         if chosen_direction == last_direction and len(sorted_dirs) > 1:
             chosen_direction, chosen_score = sorted_dirs[1]
 
-        # Skor sıfır olsa bile minimum 5 saniye yeşil ışık süresi
+        # Yeşil ışık süresi
         green_time = int(max(min(max(chosen_score, 5), 30), 5))
-        # Yeşil ışık süresi boyunca tespiti durdur
+
+        # Yeşil olan kameranın tespitini durdur
         for camera in manager.cameras:
             if camera.camera_id == chosen_direction:
                 camera.tespiti_durdur = True
 
-        # Yeşil ışık süresi
         print(f"webcam-{chosen_direction} yeşil ışık {green_time}sn")
-        vehicles_before = vehicle_data_manager.get_vehicle_data(chosen_direction).get("vehicle_count", 0)
+        vehicles_before = sum(vehicle_data_manager.get_vehicle_data(chosen_direction).values())
 
-        # ESP8266'ya veri gönder: sadece yeşil ışık süresi ve yön bilgisi
         send_to_nodemcu(chosen_direction, green_time)
 
         for s in range(green_time, 0, -1):
             print(f"webcam-{chosen_direction} yeşil ışık {s}sn")
             time.sleep(1)
 
-        # Sarı ışık simülasyonu (Python kontrol eder)
+        # Sarı ışık
         print(f"webcam-{chosen_direction} sarı ışık {yellow_time}sn")
         for s in range(yellow_time, 0, -1):
             print(f"webcam-{chosen_direction} sarı ışık {s}sn")
             time.sleep(1)
 
-        # Kırmızı ışık sırasında skor sıfırla ve tespiti yeniden başlat
+        # Kırmızı ışık
         print(f"webcam-{chosen_direction} kırmızı ışık")
-        vehicle_data_manager.reset_camera_data(chosen_direction)
 
+        # 1) Skor sıfırla
+        vehicle_data_manager.reset_camera_data(chosen_direction)
+        # 2) Tespit tekrar açılsın + tracked_objects sıfırlansın
         for camera in manager.cameras:
             if camera.camera_id == chosen_direction:
                 camera.tespiti_durdur = False
-
+                camera.tracked_objects.clear()  # <--- ÖNEMLİ: Yeni döngüde yeniden sayabilmek için ekledik
 
         # Geçen araçları hesapla
-        vehicles_after = vehicle_data_manager.get_vehicle_data(chosen_direction).get("vehicle_count", 0)
+        vehicles_after = sum(vehicle_data_manager.get_vehicle_data(chosen_direction).values())
         vehicles_cleared = max(vehicles_before - vehicles_after, 0)
         remaining_vehicles[chosen_direction] = max(0, remaining_vehicles[chosen_direction] - vehicles_cleared)
 
-        # Yeni yeşil ışık yönünü belirle
-        last_direction = chosen_direction  # Son seçilen yönü kaydet
+        last_direction = chosen_direction
         next_direction = None
         for dir_index, (cid, _) in enumerate(sorted_dirs):
             if cid != chosen_direction:
                 next_direction = cid
                 break
-        if next_direction is None:  # Tüm yönler sıfır skora sahipse sırayı döndür
+        if next_direction is None:
             next_direction = chosen_direction
+
 
 def send_to_nodemcu(direction, green_time):
     """
     Nodemcu'ya sadece yeşil ışık süresi ve yön bilgisini gönderir.
-    :param direction: Aktif yön bilgisi
-    :param green_time: Yeşil ışık süresi
     """
-    nodemcu_url = "http://192.168.1.114/update"  # Nodemcu'nun IP adresini buraya yazın
-
+    nodemcu_url = "http://192.168.1.114/update"  # Nodemcu IP adresini buraya yazın
     payload = f"{direction},{green_time}"
 
     headers = {
@@ -477,7 +474,7 @@ if __name__ == "__main__":
     vehicle_data_manager = VehicleDataManager()
     score_calculator = TrafficScoreCalculator()
 
-    camera_ids = [0,1]  # Burada örnek olarak 2 kamera kullandık.
+    camera_ids = [0,1]  # Örnek olarak 2 kamera
     manager = CameraManager(model, vehicle_data_manager, score_calculator, camera_ids=camera_ids)
     manager.start_cameras()
 
